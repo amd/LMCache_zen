@@ -3,11 +3,15 @@
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from enum import IntEnum
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable, Protocol
 from unittest.mock import MagicMock, PropertyMock, patch
+import ctypes
+import math
 import os
 import pickle
 import sys
+import threading
 
 # Third Party
 import pytest
@@ -32,7 +36,10 @@ from lmcache.v1.multiprocess.transfer_context.base import (
     create_engine_driven_context,
 )
 from lmcache.v1.multiprocess.transfer_context.pickle import EngineDrivenContextPickle
-from lmcache.v1.multiprocess.transfer_context.shm import EngineDrivenContextShm
+from lmcache.v1.multiprocess.transfer_context.shm import (
+    EngineDrivenContextShm,
+    ShmSlotDescriptor,
+)
 import lmcache.lmcache_native as lmcache_native
 
 if TYPE_CHECKING:
@@ -1784,6 +1791,212 @@ def test_engine_driven_context_shm_store_retrieve_flow_with_mocked_mq() -> None:
         context.close()
         shm_munmap(addr, 4096)
         shm_unlink(shm_name)
+
+
+class _FakeMultiTensorObj:
+    """Memory object holding one tensor per layout entry, packed back to back
+    from ``offset`` in ``pool`` like ``TensorMemoryObj``'s group prefix sums.
+    ``tensor`` is ``None``: multi-tensor objects must be read per part."""
+
+    def __init__(
+        self,
+        pool: torch.Tensor,
+        offset: int,
+        shapes: list[torch.Size],
+        dtypes: list[torch.dtype],
+    ) -> None:
+        sizes = [math.prod(s) * d.itemsize for s, d in zip(shapes, dtypes, strict=True)]
+        self.shm_offset = offset
+        self.shm_byte_length = sum(sizes)
+        self.metadata = SimpleNamespace(shapes=list(shapes), dtypes=list(dtypes))
+        self.tensor = None
+        self._parts: list[torch.Tensor] = []
+        start = offset
+        for shape, dtype, size in zip(shapes, dtypes, sizes, strict=True):
+            self._parts.append(pool[start : start + size].view(dtype).view(shape))
+            start += size
+
+    def get_tensor(self, index: int) -> torch.Tensor:
+        return self._parts[index]
+
+
+_MULTI_SHAPES = [torch.Size([2, 1, 4, 2]), torch.Size([1, 4, 3])]
+_MULTI_DTYPES = [torch.bfloat16, torch.float32]
+
+
+def test_shm_slot_descriptor_parts_roundtrip() -> None:
+    """Multi-tensor descriptors round-trip; single-tensor ones keep the old schema."""
+    single = ShmSlotDescriptor(offset=0, length=16, shape=[2, 2], dtype="float32")
+    assert single.to_dict() == {
+        "offset": 0,
+        "length": 16,
+        "shape": [2, 2],
+        "dtype": "float32",
+    }
+    assert ShmSlotDescriptor.from_dict(single.to_dict()) == single
+
+    multi = ShmSlotDescriptor(
+        offset=64,
+        length=48,
+        shape=[48],
+        dtype="uint8",
+        parts=[
+            ShmSlotDescriptor(offset=64, length=16, shape=[2, 4], dtype="bfloat16"),
+            ShmSlotDescriptor(offset=80, length=32, shape=[8], dtype="float32"),
+        ],
+    )
+    assert ShmSlotDescriptor.from_dict(multi.to_dict()) == multi
+
+
+def test_multi_tensor_object_shm_store_and_retrieve(stub_lmcache_native: Any) -> None:
+    """A multi-tensor object round-trips through the SHM strategy and worker
+    context: the worker's part views alias the server object's parts."""
+    # First Party
+    from lmcache.v1.multiprocess.modules.server_transfer import (
+        PickleTransferStrategy,
+        ShmTransferStrategy,
+    )
+
+    pool_size = 4096
+    obj_offset = 64
+    shm_name = f"lmcache_test_multi_{os.getpid()}"
+    addr = _create_shm_segment(shm_name, pool_size)
+    pool = torch.frombuffer(
+        (ctypes.c_uint8 * pool_size).from_address(addr), dtype=torch.uint8
+    )
+    memory_obj = _FakeMultiTensorObj(pool, obj_offset, _MULTI_SHAPES, _MULTI_DTYPES)
+    storage = MagicMock()
+    storage.reserve_write.return_value = {"obj": memory_obj}
+    storage.unsafe_read.return_value = (["obj"], [memory_obj])
+    strategy = ShmTransferStrategy(
+        storage_manager=storage,
+        pending_writes={},
+        pending_reads={},
+        pending_lock=threading.Lock(),
+        transfer_key_factory=lambda key, instance_id: (instance_id, key),
+        fallback_strategy=PickleTransferStrategy(storage),
+    )
+    metadata = EngineDrivenContextMetadata(
+        layout_desc=MemoryLayoutDesc(shapes=_MULTI_SHAPES, dtypes=_MULTI_DTYPES),
+        block_size=4,
+        use_mla=False,
+    )
+    key = _default_key()
+
+    store_prep = strategy.prepare_store(
+        key=key,
+        instance_id=1,
+        context=metadata,
+        resolve_obj_keys=lambda _key: ["obj"],
+    )
+    (slot,) = store_prep.context["slots"]
+    assert slot["offset"] == obj_offset
+    assert slot["length"] == memory_obj.shm_byte_length
+    assert [p["offset"] for p in slot["parts"]] == [obj_offset, obj_offset + 32]
+    assert [p["shape"] for p in slot["parts"]] == [list(s) for s in _MULTI_SHAPES]
+    assert [p["dtype"] for p in slot["parts"]] == ["bfloat16", "float32"]
+
+    req_client = MagicMock()
+    req_client.prepare_store.return_value = _CompletedFuture(store_prep)
+    req_client.commit_store.return_value = _CompletedFuture(True)
+    context = EngineDrivenContextShm(
+        metadata=metadata,
+        req_client=req_client,
+        mq_timeout=1.0,
+        shm_name=shm_name,
+        pool_size=pool_size,
+    )
+    try:
+        store_result = context.prepare_store(key=key, instance_id=1)
+        assert store_result is not None
+        buffers, chunk_indices = store_result
+        assert chunk_indices == [0]
+        (parts,) = buffers
+        assert isinstance(parts, list)
+        values = [
+            torch.arange(math.prod(s), dtype=d).view(s)
+            for s, d in zip(_MULTI_SHAPES, _MULTI_DTYPES, strict=True)
+        ]
+        for part, value in zip(parts, values, strict=True):
+            part.copy_(value)
+        for index, value in enumerate(values):
+            assert torch.equal(memory_obj.get_tensor(index), value)
+
+        req_client.prepare_retrieve.return_value = _CompletedFuture(
+            strategy.prepare_retrieve(
+                key=key, instance_id=1, resolve_obj_keys=lambda _key: ["obj"]
+            )
+        )
+        retrieved = context.prepare_retrieve(key=key, instance_id=1)
+        assert retrieved is not None
+        (retrieved_parts,) = retrieved
+        assert isinstance(retrieved_parts, list)
+        for part, value in zip(retrieved_parts, values, strict=True):
+            assert torch.equal(part, value)
+    finally:
+        context.close()
+        shm_munmap(addr, pool_size)
+        shm_unlink(shm_name)
+
+
+def test_multi_tensor_object_pickle_store_and_retrieve(
+    stub_lmcache_native: Any,
+) -> None:
+    """The pickle path copies and returns one tensor per part, and rejects a
+    payload whose parts do not match the object's layout."""
+    # First Party
+    from lmcache.v1.multiprocess.modules.server_transfer import (
+        PickleTransferStrategy,
+    )
+
+    pool = torch.zeros(4096, dtype=torch.uint8)
+    memory_obj = _FakeMultiTensorObj(pool, 0, _MULTI_SHAPES, _MULTI_DTYPES)
+    storage = MagicMock()
+    storage.reserve_write.return_value = {"obj": memory_obj}
+
+    @contextmanager
+    def _read_prefetched_results(_keys: Any, l1_owners: Any = None) -> Any:
+        yield [memory_obj]
+
+    storage.read_prefetched_results.side_effect = _read_prefetched_results
+    strategy = PickleTransferStrategy(storage)
+    metadata = EngineDrivenContextMetadata(
+        layout_desc=MemoryLayoutDesc(shapes=_MULTI_SHAPES, dtypes=_MULTI_DTYPES),
+        block_size=4,
+        use_mla=False,
+    )
+    key = _default_key()
+    values = [
+        torch.arange(math.prod(s), dtype=d).view(s) + 1
+        for s, d in zip(_MULTI_SHAPES, _MULTI_DTYPES, strict=True)
+    ]
+
+    assert not strategy.commit_store(
+        key=key,
+        instance_id=1,
+        cpu_data=pickle.dumps([values[:1]]),
+        context=metadata,
+        resolve_obj_keys=lambda _key: ["obj"],
+    )
+    assert not torch.any(pool)
+
+    assert strategy.commit_store(
+        key=key,
+        instance_id=1,
+        cpu_data=pickle.dumps([values]),
+        context=metadata,
+        resolve_obj_keys=lambda _key: ["obj"],
+    )
+    for index, value in enumerate(values):
+        assert torch.equal(memory_obj.get_tensor(index), value)
+
+    response = strategy.prepare_retrieve(
+        key=key, instance_id=1, resolve_obj_keys=lambda _key: ["obj"]
+    )
+    assert response.success
+    (retrieved_parts,) = pickle.loads(response.data)
+    for part, value in zip(retrieved_parts, values, strict=True):
+        assert torch.equal(part, value)
 
 
 def test_engine_driven_context_shm_init_raises_when_segment_missing() -> None:

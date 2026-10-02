@@ -44,6 +44,10 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+ChunkBuffer = torch.Tensor | list[torch.Tensor]
+"""One LMCache chunk: a tensor, or one tensor per kernel group in layout order
+when the object holds several (hybrid models)."""
+
 
 @lru_cache(maxsize=None)
 def _detect_block_transfer_accepts_tensor(transfer_fn: Callable[..., None]) -> bool:
@@ -118,7 +122,7 @@ class EngineDrivenContext(ABC):
     @abstractmethod
     def prepare_store(
         self, key: IPCCacheServerKey, instance_id: int
-    ) -> tuple[list[torch.Tensor], list[int]] | None:
+    ) -> tuple[list[ChunkBuffer], list[int]] | None:
         """Prepare SHM buffers for a store operation.
 
         Returns:
@@ -127,19 +131,21 @@ class EngineDrivenContext(ABC):
                 commit_store.
             ([], []): SHM mode but all chunks already cached. Caller should
                 skip gather and commit entirely.
-            (tensors, chunk_indices): SHM mode with new chunks to write.
-                - tensors[i] is a writable SHM-backed buffer for one chunk.
+            (buffers, chunk_indices): SHM mode with new chunks to write.
+                - buffers[i] is the writable SHM-backed buffer for one chunk:
+                  a tensor, or one tensor per kernel group (see
+                  :data:`ChunkBuffer`).
                 - chunk_indices[i] is the position of that chunk in the full
                   block_ids sequence (e.g. [0, 2] means only chunks 0 and 2
                   need writing; chunk 1 is already cached).
-                Caller gathers only these chunks into the provided tensors,
+                Caller gathers only these chunks into the provided buffers,
                 then calls commit_store with empty payload.
         """
         ...
 
     @abstractmethod
     def commit_store(
-        self, key: IPCCacheServerKey, instance_id: int, chunks: list[torch.Tensor]
+        self, key: IPCCacheServerKey, instance_id: int, chunks: list[ChunkBuffer]
     ) -> bool:
         """Commit store. Pickle: serialize and send. Shm: notify server."""
         ...
@@ -147,7 +153,7 @@ class EngineDrivenContext(ABC):
     @abstractmethod
     def prepare_retrieve(
         self, key: IPCCacheServerKey, instance_id: int
-    ) -> list[torch.Tensor] | None:
+    ) -> list[ChunkBuffer] | None:
         """Prepare retrieve. Returns chunks or shm views, or None on miss."""
         ...
 

@@ -17,6 +17,7 @@ from lmcache.logging import init_logger
 from lmcache.v1.mp_observability.errors import LMCacheTimeoutError
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.transfer_context.base import (
+    ChunkBuffer,
     EngineDrivenContext,
     EngineDrivenContextMetadata,
 )
@@ -28,32 +29,41 @@ logger = init_logger(__name__)
 
 @dataclass(frozen=True)
 class ShmSlotDescriptor:
-    """Describe one tensor slot in the shared-memory pool.
+    """Describe one object slot in the shared-memory pool.
 
     Args:
         offset: Byte offset into the shared-memory pool.
         length: Byte length of the slot.
         shape: Logical tensor shape to view at the slot.
         dtype: Torch dtype attribute name, such as ``"bfloat16"``.
+        parts: For an object holding several tensors (one per kernel group of
+            a hybrid model), one descriptor per tensor in layout order, each
+            with its own pool offset. ``None`` for a single-tensor object,
+            which is then viewed through ``shape`` and ``dtype``.
     """
 
     offset: int
     length: int
     shape: list[int]
     dtype: str
+    parts: list["ShmSlotDescriptor"] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize the slot descriptor into the MQ context schema.
 
         Returns:
             Dict payload shared between the server and worker for one SHM slot.
+            The ``parts`` key is present only for multi-tensor objects.
         """
-        return {
+        d: dict[str, Any] = {
             "offset": self.offset,
             "length": self.length,
             "shape": self.shape,
             "dtype": self.dtype,
         }
+        if self.parts is not None:
+            d["parts"] = [part.to_dict() for part in self.parts]
+        return d
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ShmSlotDescriptor":
@@ -61,7 +71,7 @@ class ShmSlotDescriptor:
 
         Args:
             d: Mapping containing ``offset``, ``length``, ``shape``, and
-                ``dtype`` fields.
+                ``dtype`` fields, plus ``parts`` for multi-tensor objects.
 
         Returns:
             Parsed immutable slot descriptor.
@@ -71,11 +81,15 @@ class ShmSlotDescriptor:
             TypeError: If ``shape`` cannot be converted with ``list(...)``.
             ValueError: If numeric fields cannot be coerced to integers.
         """
+        parts = d.get("parts")
         return cls(
             offset=int(d["offset"]),
             length=int(d["length"]),
             shape=list(d["shape"]),
             dtype=str(d["dtype"]),
+            parts=(
+                [cls.from_dict(part) for part in parts] if parts is not None else None
+            ),
         )
 
 
@@ -144,21 +158,26 @@ class EngineDrivenContextShm(EngineDrivenContext):
         )
         return tensor_1d.view(torch.Size(shape))
 
-    def _build_slot_tensors(self, slots: list[dict[str, Any]]) -> list[torch.Tensor]:
+    def _view_descriptor(self, descriptor: ShmSlotDescriptor) -> torch.Tensor:
+        return self._make_tensor_view(
+            offset=descriptor.offset,
+            length=descriptor.length,
+            shape=descriptor.shape,
+            dtype_str=descriptor.dtype,
+        )
+
+    def _build_slot_tensors(self, slots: list[dict[str, Any]]) -> list[ChunkBuffer]:
         descriptors = [ShmSlotDescriptor.from_dict(slot) for slot in slots]
         return [
-            self._make_tensor_view(
-                offset=descriptor.offset,
-                length=descriptor.length,
-                shape=descriptor.shape,
-                dtype_str=descriptor.dtype,
-            )
+            [self._view_descriptor(part) for part in descriptor.parts]
+            if descriptor.parts is not None
+            else self._view_descriptor(descriptor)
             for descriptor in descriptors
         ]
 
     def prepare_store(
         self, key: IPCCacheServerKey, instance_id: int
-    ) -> tuple[list[torch.Tensor], list[int]] | None:
+    ) -> tuple[list[ChunkBuffer], list[int]] | None:
         future = self.req_client.prepare_store(key, instance_id)
         # wait() first so a timeout raises exactly one LMCacheTimeoutError
         # (one event); result() then returns without its own timeout.
@@ -180,7 +199,7 @@ class EngineDrivenContextShm(EngineDrivenContext):
         return self._build_slot_tensors(slots), chunk_indices
 
     def commit_store(
-        self, key: IPCCacheServerKey, instance_id: int, _chunks: list[torch.Tensor]
+        self, key: IPCCacheServerKey, instance_id: int, _chunks: list[ChunkBuffer]
     ) -> bool:
         future = self.req_client.commit_store(key, instance_id, b"")
         try:
@@ -190,7 +209,7 @@ class EngineDrivenContextShm(EngineDrivenContext):
 
     def prepare_retrieve(
         self, key: IPCCacheServerKey, instance_id: int
-    ) -> list[torch.Tensor] | None:
+    ) -> list[ChunkBuffer] | None:
         future = self.req_client.prepare_retrieve(key, instance_id)
         try:
             response = future.result(timeout=self.mq_timeout)

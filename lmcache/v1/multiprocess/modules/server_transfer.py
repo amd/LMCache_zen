@@ -4,7 +4,7 @@
 # Standard
 from _thread import LockType
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 import abc
 import pickle
 
@@ -25,6 +25,7 @@ from lmcache.v1.multiprocess.transfer_context.shm import ShmSlotDescriptor
 if TYPE_CHECKING:
     # First Party
     from lmcache.v1.distributed.storage_manager import StorageManager
+    from lmcache.v1.memory_management import MemoryObj
 
 logger = init_logger(__name__)
 
@@ -32,6 +33,66 @@ logger = init_logger(__name__)
 def _dtype_to_name(dtype: torch.dtype) -> str:
     """Return a stable torch dtype name without module prefix."""
     return str(dtype).split(".")[-1]
+
+
+def _object_tensors(memory_obj: "MemoryObj") -> list[torch.Tensor] | None:
+    """Return the tensors backing ``memory_obj``, one per layout entry.
+
+    An object allocated from a multi-entry layout (one entry per kernel group
+    of a hybrid model) yields one view per entry, in layout order; any other
+    object yields its single tensor.
+
+    Returns:
+        The tensors, or ``None`` if any of them is unavailable.
+    """
+    shapes = memory_obj.metadata.shapes
+    if isinstance(shapes, list) and len(shapes) > 1:
+        tensors = [memory_obj.get_tensor(i) for i in range(len(shapes))]
+    else:
+        tensors = [memory_obj.tensor]
+    if any(t is None for t in tensors):
+        return None
+    return cast(list[torch.Tensor], tensors)
+
+
+def _slot_descriptor(memory_obj: "MemoryObj") -> dict[str, Any] | None:
+    """Describe ``memory_obj``'s SHM slot for the worker.
+
+    A single-tensor object is described by its shape and dtype. A multi-tensor
+    object is described as raw bytes plus one part per tensor, each part at
+    its own pool offset (the first tensor starts the object).
+
+    Returns:
+        The serialized slot descriptor, or ``None`` if the object has no
+        tensor view.
+    """
+    tensors = _object_tensors(memory_obj)
+    if tensors is None:
+        return None
+    if len(tensors) == 1:
+        return ShmSlotDescriptor(
+            offset=memory_obj.shm_offset,
+            length=memory_obj.shm_byte_length,
+            shape=list(tensors[0].shape),
+            dtype=_dtype_to_name(tensors[0].dtype),
+        ).to_dict()
+    base_ptr = tensors[0].data_ptr()
+    parts = [
+        ShmSlotDescriptor(
+            offset=memory_obj.shm_offset + tensor.data_ptr() - base_ptr,
+            length=tensor.numel() * tensor.element_size(),
+            shape=list(tensor.shape),
+            dtype=_dtype_to_name(tensor.dtype),
+        )
+        for tensor in tensors
+    ]
+    return ShmSlotDescriptor(
+        offset=memory_obj.shm_offset,
+        length=memory_obj.shm_byte_length,
+        shape=[memory_obj.shm_byte_length],
+        dtype="uint8",
+        parts=parts,
+    ).to_dict()
 
 
 def create_transfer_strategy(
@@ -214,7 +275,7 @@ class PickleTransferStrategy(TransferStrategy):
             ``True`` when every reserved object is written successfully.
         """
         obj_keys = resolve_obj_keys(key)
-        chunks: list[torch.Tensor] = pickle.loads(cpu_data)
+        chunks: list[torch.Tensor | list[torch.Tensor]] = pickle.loads(cpu_data)
         reserved_dict = self._storage_manager.reserve_write(
             obj_keys, context.layout_desc
         )
@@ -233,8 +294,8 @@ class PickleTransferStrategy(TransferStrategy):
                         len(chunks),
                     )
                     continue
-                memory_obj = reserved_dict[obj_key]
-                if memory_obj.tensor is None:
+                dst_tensors = _object_tensors(reserved_dict[obj_key])
+                if dst_tensors is None:
                     logger.error(
                         "Engine-driven pickle store reserved an object without "
                         "a tensor (instance_id=%d, chunk_index=%d)",
@@ -243,18 +304,20 @@ class PickleTransferStrategy(TransferStrategy):
                     )
                     continue
                 chunk_cpu = chunks[idx]
-                if chunk_cpu.shape != memory_obj.tensor.shape:
+                src_tensors = chunk_cpu if isinstance(chunk_cpu, list) else [chunk_cpu]
+                if [t.shape for t in src_tensors] != [t.shape for t in dst_tensors]:
                     logger.error(
                         "Engine-driven pickle store chunk shape mismatch "
-                        "(instance_id=%d, chunk_index=%d, chunk_shape=%s, "
-                        "object_shape=%s)",
+                        "(instance_id=%d, chunk_index=%d, chunk_shapes=%s, "
+                        "object_shapes=%s)",
                         instance_id,
                         idx,
-                        tuple(chunk_cpu.shape),
-                        tuple(memory_obj.tensor.shape),
+                        [tuple(t.shape) for t in src_tensors],
+                        [tuple(t.shape) for t in dst_tensors],
                     )
                     continue
-                memory_obj.tensor.copy_(chunk_cpu)
+                for dst, src in zip(dst_tensors, src_tensors, strict=True):
+                    dst.copy_(src)
                 written_keys.append(obj_key)
         finally:
             if written_keys:
@@ -299,13 +362,15 @@ class PickleTransferStrategy(TransferStrategy):
                 if not maybe_memory_objs or len(maybe_memory_objs) != len(obj_keys):
                     return PrepareRetrieveResponse(success=False, data=b"", context={})
                 prefetched_keys = obj_keys[: len(maybe_memory_objs)]
-                chunks = []
+                chunks: list[torch.Tensor | list[torch.Tensor]] = []
                 for memory_obj in maybe_memory_objs:
-                    if memory_obj.tensor is None:
+                    tensors = _object_tensors(memory_obj)
+                    if tensors is None:
                         return PrepareRetrieveResponse(
                             success=False, data=b"", context={}
                         )
-                    chunks.append(memory_obj.tensor.cpu().clone())
+                    copies = [t.cpu().clone() for t in tensors]
+                    chunks.append(copies[0] if len(copies) == 1 else copies)
                 return PrepareRetrieveResponse(
                     success=True, data=pickle.dumps(chunks), context={}
                 )
@@ -381,16 +446,12 @@ class ShmTransferStrategy(TransferStrategy):
         try:
             for idx, obj_key in enumerate(obj_keys):
                 memory_obj = reserved.get(obj_key)
-                if memory_obj is None or memory_obj.tensor is None:
+                if memory_obj is None:
                     continue
-                slots.append(
-                    ShmSlotDescriptor(
-                        offset=memory_obj.shm_offset,
-                        length=memory_obj.shm_byte_length,
-                        shape=list(memory_obj.tensor.shape),
-                        dtype=_dtype_to_name(memory_obj.tensor.dtype),
-                    ).to_dict()
-                )
+                slot = _slot_descriptor(memory_obj)
+                if slot is None:
+                    continue
+                slots.append(slot)
                 chunk_indices.append(idx)
                 reserved_keys.append(obj_key)
         finally:
@@ -460,17 +521,11 @@ class ShmTransferStrategy(TransferStrategy):
             return PrepareRetrieveResponse(success=False, data=b"", context={})
         slots: list[dict[str, Any]] = []
         for memory_obj in shm_memory_objs:
-            if memory_obj.tensor is None:
+            slot = _slot_descriptor(memory_obj)
+            if slot is None:
                 self._storage_manager.finish_read_prefetched(shm_prefetched_keys)
                 return PrepareRetrieveResponse(success=False, data=b"", context={})
-            slots.append(
-                ShmSlotDescriptor(
-                    offset=memory_obj.shm_offset,
-                    length=memory_obj.shm_byte_length,
-                    shape=list(memory_obj.tensor.shape),
-                    dtype=_dtype_to_name(memory_obj.tensor.dtype),
-                ).to_dict()
-            )
+            slots.append(slot)
         transfer_key = self._transfer_key_factory(key, instance_id)
         with self._pending_lock:
             self._pending_reads[transfer_key] = shm_prefetched_keys

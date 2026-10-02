@@ -4,12 +4,10 @@
 # Standard
 import pickle
 
-# Third Party
-import torch
-
 # First Party
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.transfer_context.base import (
+    ChunkBuffer,
     EngineDrivenContext,
     EngineDrivenContextMetadata,
 )
@@ -38,7 +36,7 @@ class EngineDrivenContextPickle(EngineDrivenContext):
 
     def prepare_store(
         self, key: IPCCacheServerKey, instance_id: int
-    ) -> tuple[list[torch.Tensor], list[int]] | None:
+    ) -> tuple[list[ChunkBuffer], list[int]] | None:
         """Send PREPARE_STORE RPC. For pickle, returns no pre-allocated buffers."""
         future = self.req_client.prepare_store(key, instance_id)
         try:
@@ -48,7 +46,7 @@ class EngineDrivenContextPickle(EngineDrivenContext):
         return None
 
     def commit_store(
-        self, key: IPCCacheServerKey, instance_id: int, chunks: list[torch.Tensor]
+        self, key: IPCCacheServerKey, instance_id: int, chunks: list[ChunkBuffer]
     ) -> bool:
         """Serialize chunks and send via COMMIT_STORE.
 
@@ -64,7 +62,7 @@ class EngineDrivenContextPickle(EngineDrivenContext):
 
     def prepare_retrieve(
         self, key: IPCCacheServerKey, instance_id: int
-    ) -> list[torch.Tensor] | None:
+    ) -> list[ChunkBuffer] | None:
         """Send PREPARE_RETRIEVE and deserialize the response data.
 
         Returns:
@@ -77,7 +75,7 @@ class EngineDrivenContextPickle(EngineDrivenContext):
             return None
         if not response.success or not response.data:
             return None
-        chunks: list[torch.Tensor] = pickle.loads(response.data)
+        chunks: list[ChunkBuffer] = pickle.loads(response.data)
         return chunks
 
     def commit_retrieve(self, key: IPCCacheServerKey, instance_id: int) -> bool:
