@@ -152,6 +152,25 @@ class IPCCacheServerKey:
 KVCache = list[DeviceIPCWrapper]
 
 
+class EngineDrivenKernelGroupLayout(msgspec.Struct, frozen=True):
+    """Per-chunk tensor layout of one kernel group in an engine-driven object.
+
+    Attributes:
+        num_layers: Layers in the kernel group.
+        num_physical_slots: Physical KV slots gathered into one LMCache chunk.
+        hidden_dim_size: Flattened per-slot width (``num_heads * head_size``).
+        dtype_str: Torch dtype name (e.g. ``"float16"``).
+        use_mla: Whether the group stores one plane (MLA or fused K/V)
+            rather than separate K and V planes.
+    """
+
+    num_layers: int
+    num_physical_slots: int
+    hidden_dim_size: int
+    dtype_str: str
+    use_mla: bool
+
+
 class RegisterEngineDrivenContextPayload(msgspec.Struct):
     """Payload for the REGISTER_KV_CACHE_ENGINE_DRIVEN_CONTEXT protocol message.
 
@@ -167,6 +186,10 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
         num_physical_slots: Number of physical KV slots gathered into one
             LMCache chunk. ``None`` accepts the legacy protocol, where the
             server assumed one physical slot per logical token.
+        kernel_groups: For a hybrid model, one layout per kernel group in
+            kernel-group order; each chunk is then stored as one object
+            holding one tensor per kernel group, and the single-group fields
+            above describe the first group. Empty for a single group.
     """
 
     instance_id: int
@@ -178,6 +201,9 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
     dtype_str: str
     use_mla: bool
     num_physical_slots: int | None = None
+    kernel_groups: list[EngineDrivenKernelGroupLayout] = msgspec.field(
+        default_factory=list
+    )
 
 
 @dataclass

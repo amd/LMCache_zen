@@ -21,6 +21,7 @@ import torch
 from lmcache import torch_dev, torch_device_type
 from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.multiprocess.custom_types import (
+    EngineDrivenKernelGroupLayout,
     PrepareRetrieveResponse,
     PrepareStoreResponse,
     RegisterEngineDrivenContextResponse,
@@ -959,6 +960,162 @@ def test_engine_driven_context_unregister_lifecycle(
     req_client.unregister_kv_cache_engine_driven_context.assert_called_once_with(7)
 
 
+_HYBRID_BLOCK_SIZE = 4
+_HYBRID_ATTN = ("attn_0", "attn_1")
+_HYBRID_STATE = ("state_0", "state_1")
+_HYBRID_LAYOUTS = [
+    EngineDrivenKernelGroupLayout(
+        num_layers=2,
+        num_physical_slots=_HYBRID_BLOCK_SIZE,
+        hidden_dim_size=16,
+        dtype_str="float32",
+        use_mla=False,
+    ),
+    EngineDrivenKernelGroupLayout(
+        num_layers=2,
+        num_physical_slots=_HYBRID_BLOCK_SIZE,
+        hidden_dim_size=4,
+        dtype_str="float32",
+        use_mla=False,
+    ),
+]
+
+
+def _make_hybrid_kv_caches(num_blocks: int = 6) -> dict[str, torch.Tensor]:
+    """Two KV cache groups of different widths, like a hybrid model's
+    attention layers (2 heads of 8) and state layers (1 head of 4)."""
+    kv_caches = {}
+    for name in _HYBRID_ATTN:
+        kv_caches[name] = torch.randn(2, num_blocks, _HYBRID_BLOCK_SIZE, 2, 8)
+    for name in _HYBRID_STATE:
+        kv_caches[name] = torch.randn(2, num_blocks, _HYBRID_BLOCK_SIZE, 1, 4)
+    return kv_caches
+
+
+def _register_hybrid_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Any, MagicMock, dict[str, torch.Tensor]]:
+    """Register a pickle-mode engine-driven context for the hybrid caches.
+
+    Returns ``(context, req_client, kv_caches)``; one engine block per chunk.
+    """
+    # First Party
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+    from lmcache.v1.multiprocess.transfer_context import EngineDrivenTransferContext
+
+    # Keep format discovery independent of the host running the test.
+    monkeypatch.setattr(
+        "lmcache.v1.gpu_connector.kv_format.detectors.vllm.torch_device_type",
+        torch_device_type if torch_device_type != "cpu" else "cuda",
+    )
+    future = MagicMock()
+    future.result.return_value = RegisterEngineDrivenContextResponse()
+    req_client = MagicMock()
+    req_client.register_kv_cache_engine_driven_context.return_value = future
+    kv_caches = _make_hybrid_kv_caches()
+    context = EngineDrivenTransferContext(1, req_client)
+    context.register(
+        kv_caches=kv_caches,
+        model_name="m",
+        world_size=1,
+        blocks_in_chunk=1,
+        mq_timeout=1.0,
+        engine_group_infos=[
+            EngineGroupInfo(
+                engine_group_id=0,
+                layer_indices=(0, 1),
+                tokens_per_block=_HYBRID_BLOCK_SIZE,
+            ),
+            EngineGroupInfo(
+                engine_group_id=1,
+                layer_indices=(2, 3),
+                tokens_per_block=_HYBRID_BLOCK_SIZE,
+            ),
+        ],
+    )
+    return context, req_client, kv_caches
+
+
+def test_engine_driven_register_sends_kernel_group_layouts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hybrid worker registers one layout per kernel group and stores each
+    chunk as one object holding one tensor per group."""
+    context, req_client, _ = _register_hybrid_context(monkeypatch)
+
+    payload = req_client.register_kv_cache_engine_driven_context.call_args.args[0]
+    assert payload.kernel_groups == _HYBRID_LAYOUTS
+    assert context.engine_driven_context.layout_desc.shapes == [
+        torch.Size([2, 2, _HYBRID_BLOCK_SIZE, 16]),
+        torch.Size([2, 2, _HYBRID_BLOCK_SIZE, 4]),
+    ]
+
+
+def test_engine_driven_hybrid_store_retrieve_roundtrip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each kernel group is stored from, and restored into, its own blocks."""
+    context, req_client, source = _register_hybrid_context(monkeypatch)
+    req_client.prepare_store.return_value = _CompletedFuture(
+        PrepareStoreResponse(context={})
+    )
+    req_client.commit_store.return_value = _CompletedFuture(True)
+    key = _default_key()
+
+    store = context.submit_store("r", key, source, [[0, 1], [2, 3]], None, 1)
+    assert store.result() is True
+    stored = req_client.commit_store.call_args.args[2]
+    chunks = pickle.loads(stored)
+    assert [[tuple(part.shape) for part in chunk] for chunk in chunks] == [
+        [(2, 2, _HYBRID_BLOCK_SIZE, 16), (2, 2, _HYBRID_BLOCK_SIZE, 4)]
+    ] * 2
+
+    req_client.prepare_retrieve.return_value = _CompletedFuture(
+        PrepareRetrieveResponse(success=True, data=stored, context={})
+    )
+    req_client.commit_retrieve.return_value = _CompletedFuture(True)
+    destination = {name: torch.zeros_like(t) for name, t in source.items()}
+    retrieve = context.submit_retrieve("r", key, destination, [[4, 5], [0, 1]], None, 1)
+    assert retrieve.result() is True
+    for name in _HYBRID_ATTN:
+        assert torch.equal(destination[name][:, 4:6], source[name][:, 0:2])
+        assert not torch.any(destination[name][:, :4])
+    for name in _HYBRID_STATE:
+        assert torch.equal(destination[name][:, 0:2], source[name][:, 2:4])
+        assert not torch.any(destination[name][:, 2:])
+
+
+def test_engine_driven_hybrid_rejects_mismatched_transfers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Block IDs that do not cover every kernel group equally, and retrieved
+    chunks that do not match the layout, never reach the transfer kernels."""
+    context, req_client, source = _register_hybrid_context(monkeypatch)
+    req_client.prepare_store.return_value = _CompletedFuture(
+        PrepareStoreResponse(context={})
+    )
+    key = _default_key()
+
+    with pytest.raises(ValueError, match="for 2 kernel groups, got 1"):
+        context.submit_store("r", key, source, [[0, 1]], None, 1)
+    with pytest.raises(ValueError, match="different chunk counts"):
+        context.submit_store("r", key, source, [[0, 1], [2]], None, 1)
+    req_client.commit_store.assert_not_called()
+
+    req_client.prepare_retrieve.return_value = _CompletedFuture(
+        PrepareRetrieveResponse(
+            success=True,
+            data=pickle.dumps([[torch.zeros(1), torch.zeros(1)]]),
+            context={},
+        )
+    )
+    req_client.commit_retrieve.return_value = _CompletedFuture(True)
+    destination = {name: torch.zeros_like(t) for name, t in source.items()}
+    retrieve = context.submit_retrieve("r", key, destination, [[4], [0]], None, 1)
+    assert retrieve.result() is False
+    assert not any(torch.any(t) for t in destination.values())
+
+
 @pytest.mark.parametrize(
     ("hnd_builder", "expected_format"),
     [
@@ -1368,6 +1525,32 @@ def test_server_register_uses_worker_physical_slots(
     layout = ctx.layout_desc_registry.find("m", 1)
     assert layout is not None
     assert layout.shapes[0] == torch.Size([2, 2, 128, 16])
+
+
+def test_server_register_hybrid_kernel_group_layouts(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """The server stores one layout entry per kernel group of a hybrid worker,
+    and refuses it when object groups are split, which engine-driven
+    transfer does not support."""
+    module, _, _, ctx = server_module_factory(chunk_size=_HYBRID_BLOCK_SIZE)
+    payload = _default_register_payload(instance_id=12)
+    payload.kernel_groups = _HYBRID_LAYOUTS
+
+    module.register_kv_cache_engine_driven_context(payload)
+    layout = ctx.layout_desc_registry.find("m", 1)
+    assert layout is not None
+    assert layout.shapes == [
+        torch.Size([2, 2, _HYBRID_BLOCK_SIZE, 16]),
+        torch.Size([2, 2, _HYBRID_BLOCK_SIZE, 4]),
+    ]
+    assert layout.dtypes == [torch.float32, torch.float32]
+
+    ctx._separate_object_groups = True
+    payload.instance_id = 13
+    with pytest.raises(ValueError, match="--separate-object-groups"):
+        module.register_kv_cache_engine_driven_context(payload)
 
 
 def test_server_store_and_retrieve_cpu_chunks(

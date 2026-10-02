@@ -22,6 +22,7 @@ from lmcache.v1.multiprocess.custom_types import (
     BlockAllocationRecord,
     CBMatchResult,
     CBUnifiedLookupResult,
+    EngineDrivenKernelGroupLayout,
     IPCCacheServerKey,
     PrepareRetrieveResponse,
     PrepareStoreResponse,
@@ -291,6 +292,44 @@ def test_rpc_surface_is_derived_from_split_service_descriptors() -> None:
             use_mla=False,
             num_physical_slots=32,
         ),
+    )
+
+
+def test_engine_driven_registration_round_trips_kernel_groups() -> None:
+    """A hybrid worker's per-kernel-group layouts survive the gRPC codec."""
+    registration_codec = get_method_codec_registry().by_full_name[
+        "lmcache.mp.EngineDrivenService.RegisterKvCacheEngineDrivenContext"
+    ]
+    fields = {
+        "instance_id": 7,
+        "model_name": "model",
+        "world_size": 1,
+        "block_size": 640,
+        "num_layers": 8,
+        "hidden_dim_size": 1024,
+        "dtype_str": "bfloat16",
+        "use_mla": False,
+        "num_physical_slots": 640,
+        "kernel_groups": [
+            EngineDrivenKernelGroupLayout(
+                num_layers=8,
+                num_physical_slots=640,
+                hidden_dim_size=1024,
+                dtype_str="bfloat16",
+                use_mla=False,
+            ),
+            EngineDrivenKernelGroupLayout(
+                num_layers=24,
+                num_physical_slots=640,
+                hidden_dim_size=3360,
+                dtype_str="float32",
+                use_mla=True,
+            ),
+        ],
+    }
+    request = registration_codec.request_encoder((), fields)
+    assert registration_codec.request_decoder(request) == (
+        RegisterEngineDrivenContextPayload(**fields),
     )
 
 

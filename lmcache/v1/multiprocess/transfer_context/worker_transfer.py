@@ -16,18 +16,29 @@ import torch
 from lmcache import torch_dev
 from lmcache.utils import EngineType, init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc
-from lmcache.v1.gpu_connector.utils import LayoutHints, get_device
+from lmcache.v1.gpu_connector.utils import (
+    LayoutHints,
+    get_device,
+    normalize_and_discover_per_layer_formats,
+)
+from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
 from lmcache.v1.multiprocess.custom_types import (
+    EngineDrivenKernelGroupLayout,
     RegisterEngineDrivenContextPayload,
     RegisterEngineDrivenContextResponse,
 )
 from lmcache.v1.multiprocess.futures import MessagingFuture
-from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+from lmcache.v1.multiprocess.group_view import (
+    EngineGroupInfo,
+    engine_group_layer_indices,
+)
 from lmcache.v1.multiprocess.transfer_context.base import (
+    ChunkBuffer,
     EngineDrivenContext,
     EngineDrivenContextMetadata,
     compute_kv_layout,
     create_engine_driven_context,
+    engine_driven_chunk_shape,
     gather_paged_kv_to_cpu,
     scatter_cpu_to_paged_kv,
 )
@@ -778,6 +789,12 @@ class EngineDrivenTransferContext(TransferContext):
         self._engine_driven_context: EngineDrivenContext | None = None
         self._layout_hints: LayoutHints | None = None
         self._engine_kv_format: Any = None
+        # Set by register() for a hybrid model: its kernel groups, with each
+        # group's layer names, engine blocks per chunk, and chunk tensor shape.
+        self._kv_groups: KVLayerGroupsManager | None = None
+        self._group_layer_names: list[list[str]] = []
+        self._group_blocks_per_chunk: list[int] = []
+        self._group_chunk_shapes: list[torch.Size] = []
 
     @property
     def engine_driven_context(self) -> EngineDrivenContext:
@@ -805,54 +822,80 @@ class EngineDrivenTransferContext(TransferContext):
     ) -> None:
         """Register KV caches with the non-GPU context server.
 
-        ``engine_group_infos`` and ``engine_type`` are accepted to satisfy
-        the base interface but are currently a no-op: the non-GPU transfer
-        path does not support hybrid KV cache groups and rejects multi-
-        group transfers at store / retrieve time (see
-        ``_single_group_block_ids``).
+        A hybrid model (more than one engine KV cache group) is split into
+        the kernel groups the LMCache-driven path builds, and each chunk is
+        stored as one object holding one tensor per kernel group.
+        ``engine_type`` is accepted to satisfy the base interface.
         """
         del engine_type  # unused on the engine-driven path
-        # TODO: per-group compression (EngineGroupInfo.tokens_per_block vs
-        # the tensor-detected slot count, e.g. DeepSeek V4) is only handled
-        # on the CUDA path. The non-CUDA path is yet to be implemented.
-        (
-            block_size,
-            num_layers,
-            hidden_dim_size,
-            dtype_str,
-            engine_kv_format,
-            kv_size,
-        ) = compute_kv_layout(kv_caches, layout_hints=layout_hints)
         self._layout_hints = layout_hints
-        self._engine_kv_format = engine_kv_format
-
-        # The wire field is named use_mla but only drives the object plane
-        # count: single-plane (kv_size == 1) covers MLA and fused-K/V formats.
-        use_mla_flag = kv_size == 1
-        shape = (
-            torch.Size([num_layers, blocks_in_chunk * block_size, hidden_dim_size])
-            if use_mla_flag
-            else torch.Size(
-                [2, num_layers, blocks_in_chunk * block_size, hidden_dim_size]
+        if len(engine_group_infos) > 1:
+            group_layouts = self._build_kernel_groups(
+                kv_caches, blocks_in_chunk, layout_hints, engine_group_infos
             )
-        )
-        dtype = getattr(torch, dtype_str)
-        layout_desc = MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
+            first = group_layouts[0]
+            block_size = (
+                cast(KVLayerGroupsManager, self._kv_groups)
+                .kernel_groups[0]
+                .slots_per_block
+            )
+            use_mla_flag = first.use_mla
+            layout_desc = MemoryLayoutDesc(
+                shapes=self._group_chunk_shapes,
+                dtypes=[getattr(torch, group.dtype_str) for group in group_layouts],
+            )
+            payload = RegisterEngineDrivenContextPayload(
+                instance_id=self._instance_id,
+                model_name=model_name,
+                world_size=world_size,
+                block_size=block_size,
+                num_layers=first.num_layers,
+                hidden_dim_size=first.hidden_dim_size,
+                dtype_str=first.dtype_str,
+                use_mla=use_mla_flag,
+                num_physical_slots=first.num_physical_slots,
+                kernel_groups=group_layouts,
+            )
+        else:
+            # TODO: per-group compression (EngineGroupInfo.tokens_per_block vs
+            # the tensor-detected slot count, e.g. DeepSeek V4) is only handled
+            # on the CUDA path. The non-CUDA path is yet to be implemented.
+            (
+                block_size,
+                num_layers,
+                hidden_dim_size,
+                dtype_str,
+                engine_kv_format,
+                kv_size,
+            ) = compute_kv_layout(kv_caches, layout_hints=layout_hints)
+            self._engine_kv_format = engine_kv_format
+
+            # The wire field is named use_mla but only drives the object plane
+            # count: single-plane (kv_size == 1) covers MLA and fused-K/V formats.
+            use_mla_flag = kv_size == 1
+            num_physical_slots = blocks_in_chunk * block_size
+            layout_desc = MemoryLayoutDesc(
+                shapes=[
+                    engine_driven_chunk_shape(
+                        num_layers, num_physical_slots, hidden_dim_size, use_mla_flag
+                    )
+                ],
+                dtypes=[getattr(torch, dtype_str)],
+            )
+            payload = RegisterEngineDrivenContextPayload(
+                instance_id=self._instance_id,
+                model_name=model_name,
+                world_size=world_size,
+                block_size=block_size,
+                num_layers=num_layers,
+                hidden_dim_size=hidden_dim_size,
+                dtype_str=dtype_str,
+                use_mla=use_mla_flag,
+                num_physical_slots=num_physical_slots,
+            )
 
         future = self._submit_registration(
-            lambda: self._req_client.register_kv_cache_engine_driven_context(
-                RegisterEngineDrivenContextPayload(
-                    instance_id=self._instance_id,
-                    model_name=model_name,
-                    world_size=world_size,
-                    block_size=block_size,
-                    num_layers=num_layers,
-                    hidden_dim_size=hidden_dim_size,
-                    dtype_str=dtype_str,
-                    use_mla=use_mla_flag,
-                    num_physical_slots=blocks_in_chunk * block_size,
-                )
-            )
+            lambda: self._req_client.register_kv_cache_engine_driven_context(payload)
         )
         response = future.result(timeout=mq_timeout)
         if self._is_closed():
@@ -881,6 +924,189 @@ class EngineDrivenTransferContext(TransferContext):
             self._instance_id,
             supported_transfer_mode,
         )
+
+    def _build_kernel_groups(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        blocks_in_chunk: int,
+        layout_hints: LayoutHints | None,
+        engine_group_infos: Sequence[EngineGroupInfo],
+    ) -> list[EngineDrivenKernelGroupLayout]:
+        """Split a hybrid model's layers into kernel groups.
+
+        Groups are built exactly as the LMCache-driven path builds them, so
+        stored objects share one layout across transfer modes.
+
+        Returns:
+            Each kernel group's part of a chunk object, in kernel-group order.
+
+        Raises:
+            NotImplementedError: If the engine groups report different (or no)
+                block sizes, or a kernel group is compressed.
+        """
+        block_sizes = {info.tokens_per_block for info in engine_group_infos}
+        if len(block_sizes) != 1 or 0 in block_sizes:
+            raise NotImplementedError(
+                "Engine-driven transfer needs one reported block size across "
+                f"KV cache groups, got {sorted(block_sizes)}"
+            )
+        chunk_tokens = blocks_in_chunk * block_sizes.pop()
+        normalized, engine_kv_formats = normalize_and_discover_per_layer_formats(
+            list(kv_caches.values()),
+            engine_group_layer_indices(engine_group_infos),
+            EngineType.VLLM,
+            layout_hints,
+        )
+        kv_groups = KVLayerGroupsManager(
+            list(normalized),
+            engine_kv_formats=engine_kv_formats,
+            engine_group_infos=engine_group_infos,
+            lmcache_tokens_per_chunk=chunk_tokens,
+        )
+
+        layer_names = list(kv_caches)
+        group_layouts: list[EngineDrivenKernelGroupLayout] = []
+        self._group_layer_names = []
+        self._group_blocks_per_chunk = []
+        self._group_chunk_shapes = []
+        for group_idx, group in enumerate(kv_groups.kernel_groups):
+            if group.slots_per_block != group.tokens_per_block:
+                raise NotImplementedError(
+                    f"Kernel group {group_idx} is compressed (tokens_per_block="
+                    f"{group.tokens_per_block}, slots_per_block="
+                    f"{group.slots_per_block}); engine-driven transfer does "
+                    "not support compressed KV groups"
+                )
+            layout = EngineDrivenKernelGroupLayout(
+                num_layers=group.num_layers,
+                num_physical_slots=group.calculate_slots(chunk_tokens),
+                hidden_dim_size=group.hidden_dim_size,
+                dtype_str=str(group.dtype).replace("torch.", ""),
+                use_mla=group.shape_desc.kv_size == 1,
+            )
+            group_layouts.append(layout)
+            self._group_layer_names.append(
+                [layer_names[idx] for idx in group.layer_indices]
+            )
+            self._group_blocks_per_chunk.append(
+                kv_groups.calculate_num_blocks(group_idx, chunk_tokens)
+            )
+            self._group_chunk_shapes.append(
+                engine_driven_chunk_shape(
+                    layout.num_layers,
+                    layout.num_physical_slots,
+                    layout.hidden_dim_size,
+                    layout.use_mla,
+                )
+            )
+        self._kv_groups = kv_groups
+        logger.info(
+            "Engine-driven transfer stores %d kernel groups per chunk object",
+            len(group_layouts),
+        )
+        return group_layouts
+
+    def _num_group_chunks(self, block_ids: list[list[int]]) -> int:
+        """Return the chunk count shared by every kernel group's block IDs.
+
+        Raises:
+            ValueError: If there is not one block-ID list per kernel group, or
+                the lists cover different numbers of chunks.
+        """
+        if len(block_ids) != len(self._group_blocks_per_chunk):
+            raise ValueError(
+                f"Expected block IDs for {len(self._group_blocks_per_chunk)} "
+                f"kernel groups, got {len(block_ids)}"
+            )
+        num_chunks = {
+            len(group_block_ids) // blocks_per_chunk
+            for group_block_ids, blocks_per_chunk in zip(
+                block_ids, self._group_blocks_per_chunk, strict=True
+            )
+        }
+        if len(num_chunks) != 1:
+            raise ValueError(
+                f"Kernel groups' block IDs cover different chunk counts: {num_chunks}"
+            )
+        return num_chunks.pop()
+
+    def _check_group_buffers(
+        self, buffers: list[ChunkBuffer]
+    ) -> list[list[torch.Tensor]]:
+        """Return ``buffers`` as per-group parts, checked against the layout.
+
+        Raises:
+            ValueError: If a buffer is not one tensor per kernel group with the
+                registered shape; the transfer kernels write through raw
+                pointers, so a mismatch must never reach them.
+        """
+        for buffer in buffers:
+            if (
+                not isinstance(buffer, list)
+                or [part.shape for part in buffer] != self._group_chunk_shapes
+            ):
+                raise ValueError(
+                    "Chunk buffer does not match the registered kernel-group "
+                    f"layout {[tuple(s) for s in self._group_chunk_shapes]}"
+                )
+        return cast(list[list[torch.Tensor]], buffers)
+
+    def _gather_kernel_groups(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        block_ids: list[list[int]],
+        out_buffers: list[ChunkBuffer] | None,
+        chunk_indices: list[int] | None,
+    ) -> list[list[torch.Tensor]]:
+        """Gather each kernel group into its part of every chunk object."""
+        self._num_group_chunks(block_ids)
+        parts_out = (
+            None if out_buffers is None else self._check_group_buffers(out_buffers)
+        )
+        kv_groups = cast(KVLayerGroupsManager, self._kv_groups)
+        per_group: list[list[torch.Tensor]] = []
+        for group_idx, group in enumerate(kv_groups.kernel_groups):
+            per_group.append(
+                gather_paged_kv_to_cpu(
+                    {
+                        name: kv_caches[name]
+                        for name in self._group_layer_names[group_idx]
+                    },
+                    block_ids[group_idx],
+                    self._group_blocks_per_chunk[group_idx],
+                    layout_hints=self._layout_hints,
+                    engine_kv_format=group.engine_kv_format,
+                    out=(
+                        None
+                        if parts_out is None
+                        else [parts[group_idx] for parts in parts_out]
+                    ),
+                    chunk_indices=chunk_indices,
+                )
+            )
+        return [list(parts) for parts in zip(*per_group, strict=True)]
+
+    def _scatter_kernel_groups(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        block_ids: list[list[int]],
+        src_buffers: list[ChunkBuffer],
+        skip_first_n_tokens: int,
+    ) -> None:
+        """Scatter each kernel group's part of every chunk object back."""
+        self._num_group_chunks(block_ids)
+        parts_in = self._check_group_buffers(src_buffers)
+        kv_groups = cast(KVLayerGroupsManager, self._kv_groups)
+        for group_idx, group in enumerate(kv_groups.kernel_groups):
+            scatter_cpu_to_paged_kv(
+                {name: kv_caches[name] for name in self._group_layer_names[group_idx]},
+                block_ids[group_idx],
+                [parts[group_idx] for parts in parts_in],
+                self._group_blocks_per_chunk[group_idx],
+                skip_first_n_tokens=skip_first_n_tokens,
+                layout_hints=self._layout_hints,
+                engine_kv_format=group.engine_kv_format,
+            )
 
     def unregister(self) -> MessagingFuture[Any] | None:
         """Start engine-driven unregistration for this worker instance.
@@ -935,15 +1161,25 @@ class EngineDrivenTransferContext(TransferContext):
             future: MessagingFuture[bool] = MessagingFuture()
             future.set_result(True)
             return future
-        cpu_chunks = gather_paged_kv_to_cpu(
-            kv_caches,
-            _single_group_block_ids(block_ids),
-            blocks_in_chunk,
-            layout_hints=self._layout_hints,
-            engine_kv_format=self._engine_kv_format,
-            out=out_buffers,
-            chunk_indices=chunk_indices,
-        )
+        cpu_chunks: list[ChunkBuffer]
+        if self._kv_groups is not None:
+            cpu_chunks = list(
+                self._gather_kernel_groups(
+                    kv_caches, block_ids, out_buffers, chunk_indices
+                )
+            )
+        else:
+            cpu_chunks = list(
+                gather_paged_kv_to_cpu(
+                    kv_caches,
+                    _single_group_block_ids(block_ids),
+                    blocks_in_chunk,
+                    layout_hints=self._layout_hints,
+                    engine_kv_format=self._engine_kv_format,
+                    out=cast(list[torch.Tensor] | None, out_buffers),
+                    chunk_indices=chunk_indices,
+                )
+            )
         # Gather issues async device->CPU copies on BOTH transports: into the
         # SHM slots when out_buffers is given, otherwise into fresh buffers that
         # commit_store serializes immediately. Either way the copies must be
@@ -980,15 +1216,20 @@ class EngineDrivenTransferContext(TransferContext):
         ok = src_buffers is not None
         if src_buffers is not None:
             try:
-                scatter_cpu_to_paged_kv(
-                    kv_caches,
-                    _single_group_block_ids(block_ids),
-                    src_buffers,
-                    blocks_in_chunk,
-                    skip_first_n_tokens=skip_first_n_tokens,
-                    layout_hints=self._layout_hints,
-                    engine_kv_format=self._engine_kv_format,
-                )
+                if self._kv_groups is not None:
+                    self._scatter_kernel_groups(
+                        kv_caches, block_ids, src_buffers, skip_first_n_tokens
+                    )
+                else:
+                    scatter_cpu_to_paged_kv(
+                        kv_caches,
+                        _single_group_block_ids(block_ids),
+                        cast(list[torch.Tensor], src_buffers),
+                        blocks_in_chunk,
+                        skip_first_n_tokens=skip_first_n_tokens,
+                        layout_hints=self._layout_hints,
+                        engine_kv_format=self._engine_kv_format,
+                    )
             except (RuntimeError, ValueError, TypeError, IndexError):
                 logger.exception("Failed to scatter retrieved CPU context chunks")
                 ok = False

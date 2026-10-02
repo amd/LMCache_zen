@@ -8,6 +8,15 @@ package lmcache.mp;
 
 import "common.proto";
 
+// EngineDrivenKernelGroupLayout mirrors the Python msgspec.Struct field-by-field.
+message EngineDrivenKernelGroupLayout {
+  int64 num_layers = 1;
+  int64 num_physical_slots = 2;
+  int64 hidden_dim_size = 3;
+  string dtype_str = 4;
+  bool use_mla = 5;
+}
+
 message RegisterKvCacheEngineDrivenContextRequest {
   int64 instance_id = 1;
   string model_name = 2;
@@ -18,6 +27,7 @@ message RegisterKvCacheEngineDrivenContextRequest {
   string dtype_str = 7;
   bool use_mla = 8;
   optional int64 num_physical_slots = 9;
+  repeated EngineDrivenKernelGroupLayout kernel_groups = 10;
 }
 
 message RegisterKvCacheEngineDrivenContextResponse {

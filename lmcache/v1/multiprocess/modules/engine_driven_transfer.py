@@ -26,7 +26,10 @@ from lmcache.v1.multiprocess.custom_types import (
 from lmcache.v1.multiprocess.engine_context import MPCacheServerContext, ShmPoolInfo
 from lmcache.v1.multiprocess.engine_module import InstanceLivenessTarget
 from lmcache.v1.multiprocess.request_handler import HandlerType, request_handler
-from lmcache.v1.multiprocess.transfer_context.base import EngineDrivenContextMetadata
+from lmcache.v1.multiprocess.transfer_context.base import (
+    EngineDrivenContextMetadata,
+    engine_driven_chunk_shape,
+)
 
 # Local
 from .server_transfer import (
@@ -262,10 +265,12 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             payload: Struct containing all registration fields
                 (instance_id, model_name, world_size, block_size,
                 num_layers, hidden_dim_size, dtype_str, use_mla,
-                num_physical_slots).
+                num_physical_slots, and kernel_groups for a hybrid model).
 
         Raises:
-            ValueError: If ``payload.dtype_str`` is not a valid torch dtype name.
+            ValueError: If a dtype name is not a valid torch dtype, a slot
+                count is not positive, or a hybrid worker registers while the
+                server separates object groups.
         """
         shm_name = self._shm_pool_info["shm_name"]
         pool_size = self._shm_pool_info["pool_size"]
@@ -283,34 +288,66 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                     shm_name=shm_name, pool_size=pool_size
                 )
 
-        dtype = getattr(torch, payload.dtype_str, None)
-        if dtype is None or not isinstance(dtype, torch.dtype):
-            raise ValueError(
-                f"Invalid dtype_str '{payload.dtype_str}': must be a valid torch dtype "
-                "attribute name (e.g. 'float16' for torch.float16, "
-                "'bfloat16' for torch.bfloat16, 'float32' for torch.float32)."
-            )
+        if payload.kernel_groups:
+            if len(payload.kernel_groups) > 1 and self._ctx.separate_object_groups:
+                raise ValueError(
+                    "Engine-driven transfer stores every kernel group of a hybrid "
+                    "model in one object group; --separate-object-groups is not "
+                    "supported for engine-driven workers"
+                )
+            group_layouts = [
+                (
+                    group.num_layers,
+                    group.num_physical_slots,
+                    group.hidden_dim_size,
+                    group.dtype_str,
+                    group.use_mla,
+                )
+                for group in payload.kernel_groups
+            ]
+        else:
+            num_physical_slots = payload.num_physical_slots
+            if num_physical_slots is None:
+                # Compatibility with clients from before the physical-slot field
+                # was added. Those clients require one slot per logical token.
+                num_physical_slots = self._ctx.chunk_size
+            group_layouts = [
+                (
+                    payload.num_layers,
+                    num_physical_slots,
+                    payload.hidden_dim_size,
+                    payload.dtype_str,
+                    payload.use_mla,
+                )
+            ]
 
-        num_physical_slots = payload.num_physical_slots
-        if num_physical_slots is None:
-            # Compatibility with clients from before the physical-slot field
-            # was added. Those clients require one slot per logical token.
-            num_physical_slots = self._ctx.chunk_size
-        elif num_physical_slots <= 0:
-            raise ValueError(
-                f"num_physical_slots must be positive, got {num_physical_slots}"
+        shapes: list[torch.Size] = []
+        dtypes: list[torch.dtype] = []
+        for (
+            num_layers,
+            num_physical_slots,
+            hidden_dim_size,
+            dtype_str,
+            use_mla,
+        ) in group_layouts:
+            dtype = getattr(torch, dtype_str, None)
+            if dtype is None or not isinstance(dtype, torch.dtype):
+                raise ValueError(
+                    f"Invalid dtype_str '{dtype_str}': must be a valid torch dtype "
+                    "attribute name (e.g. 'float16' for torch.float16, "
+                    "'bfloat16' for torch.bfloat16, 'float32' for torch.float32)."
+                )
+            if num_physical_slots <= 0:
+                raise ValueError(
+                    f"num_physical_slots must be positive, got {num_physical_slots}"
+                )
+            shapes.append(
+                engine_driven_chunk_shape(
+                    num_layers, num_physical_slots, hidden_dim_size, use_mla
+                )
             )
-
-        shape = (
-            torch.Size(
-                [payload.num_layers, num_physical_slots, payload.hidden_dim_size]
-            )
-            if payload.use_mla
-            else torch.Size(
-                [2, payload.num_layers, num_physical_slots, payload.hidden_dim_size]
-            )
-        )
-        layout_desc = MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
+            dtypes.append(dtype)
+        layout_desc = MemoryLayoutDesc(shapes=shapes, dtypes=dtypes)
         metadata = EngineDrivenContextMetadata(
             layout_desc=layout_desc,
             block_size=payload.block_size,

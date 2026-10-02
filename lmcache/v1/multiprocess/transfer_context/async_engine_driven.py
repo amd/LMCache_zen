@@ -212,6 +212,12 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                 "Engine-driven transfer context is not registered. "
                 "Call register() before submit_store()."
             )
+        if self._kv_groups is not None:
+            # The pinned staging below holds one tensor per chunk; hybrid
+            # chunks hold one per kernel group, so store them synchronously.
+            return super().submit_store(
+                _request_id, key, kv_caches, block_ids, _event, blocks_in_chunk
+            )
         if _event is None:
             raise RuntimeError(
                 "Async engine-driven transfer requires a local ordering event."

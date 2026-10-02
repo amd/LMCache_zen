@@ -49,6 +49,18 @@ ChunkBuffer = torch.Tensor | list[torch.Tensor]
 when the object holds several (hybrid models)."""
 
 
+def engine_driven_chunk_shape(
+    num_layers: int, num_physical_slots: int, hidden_dim_size: int, use_mla: bool
+) -> torch.Size:
+    """Shape of one gathered chunk tensor, as produced by
+    :func:`gather_paged_kv_to_cpu`: ``[num_layers, slots, hidden]`` for
+    single-plane formats (MLA, fused K/V), else ``[2, num_layers, slots, hidden]``.
+    """
+    if use_mla:
+        return torch.Size([num_layers, num_physical_slots, hidden_dim_size])
+    return torch.Size([2, num_layers, num_physical_slots, hidden_dim_size])
+
+
 @lru_cache(maxsize=None)
 def _detect_block_transfer_accepts_tensor(transfer_fn: Callable[..., None]) -> bool:
     """Inspect the selected transfer op, caching capabilities per callable.

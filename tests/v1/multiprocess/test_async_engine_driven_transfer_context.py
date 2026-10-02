@@ -147,6 +147,25 @@ def test_submit_store_returns_pending_future_until_gather_and_commit(
     ctx.close()
 
 
+def test_submit_store_runs_hybrid_stores_on_the_sync_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hybrid chunks hold one tensor per kernel group, which the pinned
+    staging does not handle, so their stores take the synchronous path."""
+    ctx = _new_context(
+        monkeypatch, gather_gate=threading.Event(), commit_impl=lambda _c: True
+    )
+    ctx._kv_groups = MagicMock()
+    sync_future = MagicMock()
+    sync_store = MagicMock(return_value=sync_future)
+    monkeypatch.setattr(EngineDrivenTransferContext, "submit_store", sync_store)
+    args = ("r1", object(), {"k": torch.zeros(1)}, [[0], [1]], object(), 1)
+
+    assert ctx.submit_store(*args) is sync_future
+    sync_store.assert_called_once_with(*args)
+    ctx.close()
+
+
 def test_create_recorded_event_uses_local_device_event(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
