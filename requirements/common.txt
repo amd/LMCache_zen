@@ -27,7 +27,7 @@ pyyaml
 pyzmq >= 25.0.0
 grpcio>=1.78.0
 grpcio-observability==1.78.0; platform_system == "Linux"
-protobuf>=6.31.1,<7
+protobuf>=7.36.2,<8
 redis
 safetensors
 setuptools>=77.0.3,<81.0.0
