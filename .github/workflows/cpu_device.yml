@@ -203,7 +203,7 @@ jobs:
       # Cache key varies per model so the two matrix legs don't
       # thrash each other's HF hub directory.
       - name: Cache HuggingFace hub (${{ matrix.model.name }})
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/huggingface
           key: hf-hub-${{ matrix.model.name }}-v2
