@@ -45,7 +45,7 @@ jobs:
           echo "TAG=nightly-${DATE}" >> "$GITHUB_OUTPUT"
 
       - name: Build and push image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: operator
           platforms: linux/amd64
